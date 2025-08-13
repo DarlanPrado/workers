@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"runtime"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -19,7 +18,7 @@ type job struct {
 	outputPath string
 }
 
-// calculo do DV direto em bytes para evitar strings temporárias
+// calcular DV diretamente em bytes
 func calcularDVBytes(cnpj12 []byte) [2]byte {
 	pesos1 := [...]int{5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2}
 	pesos2 := [...]int{6, 5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2}
@@ -38,7 +37,6 @@ func calcularDVBytes(cnpj12 []byte) [2]byte {
 
 	dv1 := calc(cnpj12, pesos1[:])
 	dv2 := calc(append(cnpj12, dv1), pesos2[:])
-
 	return [2]byte{dv1, dv2}
 }
 
@@ -49,7 +47,7 @@ func gerarBloco(j job, globalCount *uint64) error {
 	}
 	defer f.Close()
 
-	w := bufio.NewWriterSize(f, 8*1024*1024) // buffer maior
+	w := bufio.NewWriterSize(f, 8*1024*1024)
 	defer w.Flush()
 
 	total := j.baseEnd - j.baseStart + 1
@@ -57,31 +55,23 @@ func gerarBloco(j job, globalCount *uint64) error {
 	logInterval := 500_000
 	local := 0
 
-	// buffer de 12 bytes fixos para base + matriz
 	cnpj12 := make([]byte, 12)
-	cnpj12[8] = '0'
-	cnpj12[9] = '0'
-	cnpj12[10] = '0'
-	cnpj12[11] = '1'
+	cnpj12[8], cnpj12[9], cnpj12[10], cnpj12[11] = '0', '0', '0', '1'
 
-	linha := make([]byte, 15) // 14 dígitos + \n
-	linha[14] = '\n'
+	linha := make([]byte, 14) // 12 + 2 DV
 
-	fmt.Printf("🧵 worker %02d → %08d..%08d (%,d)\n", j.idx, j.baseStart, j.baseEnd, total)
+	fmt.Printf("🧵 Worker %02d → %08d..%08d (%,d)\n", j.idx, j.baseStart, j.baseEnd, total)
 
 	for base := j.baseStart; base <= j.baseEnd; base++ {
-		// escreve base como 8 dígitos no slice
+		temp := base
 		for i := 7; i >= 0; i-- {
-			cnpj12[i] = byte('0' + base%10)
-			base /= 10
+			cnpj12[i] = byte('0' + temp%10)
+			temp /= 10
 		}
 
 		dv := calcularDVBytes(cnpj12)
-
-		// junta base + matriz + dv no buffer de linha
 		copy(linha[0:12], cnpj12)
-		linha[12] = dv[0]
-		linha[13] = dv[1]
+		linha[12], linha[13] = dv[0], dv[1]
 
 		w.Write(linha)
 		local++
@@ -90,13 +80,13 @@ func gerarBloco(j job, globalCount *uint64) error {
 			elapsed := time.Since(start).Seconds()
 			vel := float64(local) / elapsed
 			eta := float64(total-local) / vel
-			fmt.Printf("🧵 worker %02d → %,d/%,d (%.2f%%) ~%.0f/s ETA: %.0fs\n",
+			fmt.Printf("🧵 Worker %02d → %,d/%,d (%.2f%%) ~%.0f/s ETA: %.0fs\n",
 				j.idx, local, total, (float64(local)/float64(total))*100, vel, eta)
 		}
 	}
 
 	atomic.AddUint64(globalCount, uint64(local))
-	fmt.Printf("✅ worker %02d → %.2fs\n", j.idx, time.Since(start).Seconds())
+	fmt.Printf("✅ Worker %02d → %.2fs\n", j.idx, time.Since(start).Seconds())
 	return nil
 }
 
@@ -105,15 +95,20 @@ func main() {
 	endBase := flag.Int("end", 99_999_999, "base final")
 	blockSize := flag.Int("block", 1_000_000, "tamanho do bloco")
 	workers := flag.Int("workers", 8, "quantidade de workers")
-	outDir := flag.String("out", ".", "diretório de saída")
+	outDir := flag.String("out", "./output", "diretório de saída")
 	flag.Parse()
+
+	if *workers > 8 {
+		fmt.Println("⚠️ Ajustando workers para 8 (número de núcleos físicos).")
+		*workers = 8
+	}
 
 	totalBases := (*endBase - *startBase + 1)
 	fmt.Printf("🚀 %08d..%08d (%,d bases) bloco: %,d workers: %d\n",
 		*startBase, *endBase, totalBases, *blockSize, *workers)
 
 	if err := os.MkdirAll(*outDir, 0o755); err != nil {
-		fmt.Printf("erro ao criar saída: %v\n", err)
+		fmt.Printf("Erro ao criar saída: %v\n", err)
 		return
 	}
 
@@ -123,7 +118,7 @@ func main() {
 		if fim > *endBase {
 			fim = *endBase
 		}
-		out := fmt.Sprintf("%s/cnpjs_%08d_%08d.txt", *outDir, inicio, fim)
+		out := fmt.Sprintf("%s/cnpjs_%08d_%08d.bin", *outDir, inicio, fim)
 		jobs = append(jobs, job{idx: len(jobs) + 1, baseStart: inicio, baseEnd: fim, outputPath: out})
 	}
 
@@ -131,7 +126,7 @@ func main() {
 	var wg sync.WaitGroup
 	var globalCount uint64
 
-	// monitor global
+	// Monitor global
 	stopTick := make(chan struct{})
 	go func() {
 		t := time.NewTicker(2 * time.Second)
@@ -159,7 +154,7 @@ func main() {
 			defer wg.Done()
 			for j := range jobCh {
 				if err := gerarBloco(j, &globalCount); err != nil {
-					fmt.Printf("❌ worker %02d: %v\n", id, err)
+					fmt.Printf("❌ Worker %02d: %v\n", id, err)
 				}
 			}
 		}(w)
@@ -175,6 +170,6 @@ func main() {
 	startAll := time.Now()
 	wg.Wait()
 	close(stopTick)
-	fmt.Printf("🎉 total: %,d | tempo: %.2fs | arquivos: %d\n",
+	fmt.Printf("🎉 Total: %,d | tempo: %.2fs | arquivos: %d\n",
 		atomic.LoadUint64(&globalCount), time.Since(startAll).Seconds(), len(jobs))
 }
